@@ -16,7 +16,7 @@
 #   - go right into the graveyard to find the second key (top left of the map)
 #   - bring both keys back to spawn and walk into the north door to win
 
-import pygame, sys, math
+import pygame, sys, math, array, json
 from game_objects import (
     Player, Enemy, Slime, GraveyardSkeleton, Item, Tile, HUD,
     Room, ScrollRoom, build_all_rooms,
@@ -28,8 +28,11 @@ from game_objects import (
 
 FPS          = 60
 WINDOW_TITLE = "Dungeons and Data"
+PROJECT_VERSION = "v0.6.0"
 COLOR_BLACK  = (0,0,0)
 TRANS_FRAMES = 30   # fade transition takes 30 frames (half a second)
+TITLE_START_DELAY_FRAMES = FPS * 2 + FPS // 2   # 2.5 seconds from title to gameplay
+SAVE_FILE = "savegame.json"
 
 
 # =============================================================================
@@ -47,6 +50,25 @@ def _sfx(path):
     print(f"[audio] missing: {path}")
     return None
 
+def make_fanfare_sfx():
+    # tiny generated pickup jingle so the project does not need another audio file
+    try:
+        sample_rate = 44100
+        notes = [(523.25,0.12),(659.25,0.12),(783.99,0.16),(1046.5,0.32)]
+        samples = array.array('h')
+        for freq,duration in notes:
+            count = int(sample_rate * duration)
+            for i in range(count):
+                fade = min(1.0, i / 600, (count - i) / 1200)
+                wave = math.sin(2 * math.pi * freq * i / sample_rate)
+                value = int(15000 * wave * fade)
+                samples.append(value)
+                samples.append(value)
+        return pygame.mixer.Sound(buffer=samples.tobytes())
+    except Exception as e:
+        print(f"[audio] fanfare error: {e}")
+        return None
+
 def load_audio():
     pygame.mixer.pre_init(44100, -16, 2, 512)
     pygame.mixer.init()
@@ -60,6 +82,7 @@ def load_audio():
         'enemy_hit':   _sfx(p('EnemyHit.mp3')),
         'item_grab':   _sfx(p('ItemGrab.mp3')),
         'player_hit':  _sfx(p('PlayerHit.mp3')),
+        'fanfare':     make_fanfare_sfx(),
     }
     return audio
 
@@ -178,6 +201,7 @@ def clamp_scroll(player, room):
 # =============================================================================
 
 def check_collisions(player, room, audio=None):
+    fanfare_item = None
     # item pickup
     for item in room.items:
         if item.collected: continue
@@ -188,6 +212,8 @@ def check_collisions(player, room, audio=None):
             elif item.item_type == 'sword_upgrade':  player.apply_upgrade()
             elif item.item_type == 'sword':          player.has_sword = True
             elif item.item_type == 'key':            player.keys = min(player.keys+1,2)
+            if item.item_type in ('key','sword','sword_upgrade'):
+                fanfare_item = item
 
     # build the sword hitbox one tile in front of the player while attacking
     attack_rect = None
@@ -217,6 +243,7 @@ def check_collisions(player, room, audio=None):
                 loot = enemy.drop_loot()
                 if loot:
                     room.items.append(Item(enemy.rect.x+12, enemy.rect.y+12, loot))
+    return fanfare_item
 
 
 # =============================================================================
@@ -306,18 +333,58 @@ def _draw_locked_flash(screen, timer_ref, font):
 
 def _draw_minimap(screen, room, player):
     # small minimap in the bottom left corner for scroll rooms
-    # shows player position and key location
+    # shows explored terrain, player position, and key location
     mm_w,mm_h = 96,64
     mm_x,mm_y = 8, SCREEN_H-mm_h-8
     mm = pygame.Surface((mm_w,mm_h),pygame.SRCALPHA)
-    mm.fill((0,0,0,140))
+    mm.fill((0,0,0,190))
+    tile_colors = {
+        'floor':          (38,120,38,210),
+        'grass2':         (42,135,42,210),
+        'grass3':         (48,145,48,210),
+        'path':           (160,125,70,220),
+        'wall':           (110,105,95,230),
+        'stone_wall':     (90,88,82,230),
+        'water':          (35,95,185,220),
+        'tree':           (20,85,25,220),
+        'purple_grass':   (58,34,76,220),
+        'purple_grass2':  (66,40,84,220),
+        'purple_grass3':  (74,48,94,220),
+        'dead_tree':      (75,64,62,220),
+        'dark_stone_wall':(58,50,68,230),
+        'locked_door':    (190,145,45,230),
+        'open_door':      (105,75,35,220),
+    }
+    cell_w = max(1, mm_w / room.cols)
+    cell_h = max(1, mm_h / room.rows)
+    for tile in room.tiles:
+        col = tile.world_x // TILE_SIZE
+        row = tile.world_y // TILE_SIZE
+        if (col,row) not in room.explored_tiles:
+            continue
+        color = tile_colors.get(tile.tile_type, (90,90,90,210))
+        x = int(col * cell_w)
+        y = int(row * cell_h)
+        w = max(1, int((col + 1) * cell_w) - x)
+        h = max(1, int((row + 1) * cell_h) - y)
+        pygame.draw.rect(mm,color,(x,y,w,h))
+
+    cam_rect = pygame.Rect(
+        int(room.cam_x / room.world_w * mm_w),
+        int(room.cam_y / room.world_h * mm_h),
+        max(3, int(room.VIEWPORT_W / room.world_w * mm_w)),
+        max(3, int(room.VIEWPORT_H / room.world_h * mm_h)),
+    )
+    pygame.draw.rect(mm,(255,255,255,70),cam_rect,1)
     # player dot
     px_f = player.rect.centerx/room.world_w
     py_f = player.rect.centery/room.world_h
     pygame.draw.rect(mm,(80,200,80),(int(px_f*mm_w)-2, int(py_f*mm_h)-2, 4,4))
     # key dot if not yet collected
     for item in room.items:
-        if not item.collected and item.item_type=='key':
+        item_col = item.rect.centerx // TILE_SIZE
+        item_row = item.rect.centery // TILE_SIZE
+        if not item.collected and item.item_type=='key' and (item_col,item_row) in room.explored_tiles:
             kx=int(item.rect.centerx/room.world_w*mm_w)
             ky=int(item.rect.centery/room.world_h*mm_h)
             pygame.draw.rect(mm,(220,185,50),(kx-2,ky-2,4,4))
@@ -365,10 +432,160 @@ def nudge_back(player, direction):
     elif direction=='east':  player.rect.x -= push
     elif direction=='west':  player.rect.x += push
 
+def save_game(player, room, rooms):
+    save_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), SAVE_FILE)
+    data = {
+        'version': PROJECT_VERSION,
+        'room_id': room.room_id,
+        'player': {
+            'x': player.rect.x,
+            'y': player.rect.y,
+            'hp_float': player.hp_float,
+            'max_hp': player.max_hp,
+            'has_sword': player.has_sword,
+            'has_upgrade': player.has_upgrade,
+            'sword_damage': player.sword_damage,
+            'keys': player.keys,
+            'direction': player.direction,
+        },
+        'rooms': {
+            room_id: {
+                'locked_exits': sorted(list(r.locked_exits)),
+                'explored_tiles': sorted([list(pos) for pos in getattr(r, 'explored_tiles', set())]),
+                'items': [
+                    {
+                        'type': item.item_type,
+                        'x': item.rect.x,
+                        'y': item.rect.y,
+                        'collected': item.collected,
+                    }
+                    for item in r.items
+                ],
+            }
+            for room_id,r in rooms.items()
+        },
+    }
+    with open(save_path, 'w') as f:
+        json.dump(data, f, indent=2)
+    return save_path
+
 
 # =============================================================================
 # screens
 # =============================================================================
+
+def show_pause_menu(screen, clock, room, player, hud, rooms, audio=None):
+    font_title = pygame.font.SysFont("Arial", 44, bold=True)
+    font_item = pygame.font.SysFont("Arial", 24)
+    font_small = pygame.font.SysFont("Arial", 16)
+    status_text = ""
+
+    while True:
+        if is_scroll(room):
+            room.draw(screen)
+            px = player.rect.x - room.cam_x
+            py = player.rect.y - room.cam_y + HUD_H
+            screen.blit(player.image, (px, py))
+            hud.draw(screen)
+            _draw_minimap(screen, room, player)
+        else:
+            screen.fill(COLOR_BLACK)
+            room.draw(screen)
+            player.draw(screen)
+            hud.draw(screen)
+
+        overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        overlay.fill((0,0,0,180))
+        screen.blit(overlay, (0,0))
+
+        title = font_title.render("PAUSED", True, (240,240,240))
+        screen.blit(title, (SCREEN_W//2-title.get_width()//2, 150))
+
+        options = [
+            "S  Save Game",
+            "Q  Exit Game",
+            "ESC  Resume",
+        ]
+        for i,text in enumerate(options):
+            option = font_item.render(text, True, (220,220,220))
+            screen.blit(option, (SCREEN_W//2-option.get_width()//2, 240+i*42))
+
+        version = font_small.render(PROJECT_VERSION, True, (160,160,160))
+        screen.blit(version, (SCREEN_W-version.get_width()-10, SCREEN_H-20))
+
+        if status_text:
+            status = font_small.render(status_text, True, (255,230,140))
+            screen.blit(status, (SCREEN_W//2-status.get_width()//2, 390))
+
+        pygame.display.flip()
+        clock.tick(FPS)
+
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                return 'exit'
+            if e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_ESCAPE:
+                    return 'resume'
+                if e.key == pygame.K_q:
+                    return 'exit'
+                if e.key == pygame.K_s:
+                    save_path = save_game(player, room, rooms)
+                    status_text = f"Saved to {SAVE_FILE}"
+
+def show_item_fanfare(screen, clock, room, player, hud, item, audio=None):
+    play_sfx(audio.get('fanfare') if audio else None, volume=0.9)
+    total_frames = 105
+    item_image = item.image
+    font = pygame.font.SysFont("Arial", 20, bold=True)
+    item_names = {
+        'key': 'KEY',
+        'sword': 'SWORD',
+        'sword_upgrade': 'POWER SWORD',
+    }
+    label = font.render(f"GOT {item_names.get(item.item_type, item.item_type.upper())}!", True, (255,240,150))
+
+    for frame in range(total_frames):
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+
+        if is_scroll(room):
+            room.draw(screen)
+            px = player.rect.x - room.cam_x
+            py = player.rect.y - room.cam_y + HUD_H
+            if not (player.invincible and player.invincible_timer % 6 < 3):
+                screen.blit(player.image, (px, py))
+            base_x = player.rect.centerx - room.cam_x
+            base_y = player.rect.y - room.cam_y + HUD_H
+            hud.draw(screen)
+            _draw_minimap(screen, room, player)
+        else:
+            screen.fill(COLOR_BLACK)
+            room.draw(screen)
+            player.draw(screen)
+            base_x = player.rect.centerx
+            base_y = player.rect.y
+            hud.draw(screen)
+
+        lift = min(frame, 18)
+        bob = int(3 * math.sin(frame * 0.25))
+        hold_x = base_x - item_image.get_width() // 2
+        hold_y = base_y - item_image.get_height() - 10 - lift + bob
+        screen.blit(item_image, (hold_x, hold_y))
+
+        for i in range(8):
+            sparkle_angle = frame * 0.12 + i * math.pi / 4
+            radius = 28 + (frame % 18)
+            sx = int(base_x + math.cos(sparkle_angle) * radius)
+            sy = int(hold_y + item_image.get_height() // 2 + math.sin(sparkle_angle) * 16)
+            color = (255,245,160) if i % 2 == 0 else (255,255,255)
+            pygame.draw.rect(screen, color, (sx, sy, 3, 3))
+
+        label_alpha = min(255, frame * 8, (total_frames - frame) * 8)
+        label.set_alpha(label_alpha)
+        screen.blit(label, (SCREEN_W//2 - label.get_width()//2, 110))
+        pygame.display.flip()
+        clock.tick(FPS)
 
 def show_win_screen(screen, clock, audio=None):
     # you win! white background, pulsing gold text
@@ -408,6 +625,7 @@ def show_title(screen, clock, audio=None):
     ft = pygame.font.SysFont("Arial",52,bold=True)
     fs = pygame.font.SysFont("Arial",22)
     fh = pygame.font.SysFont("Arial",16)
+    fv = pygame.font.SysFont("Arial",14)
     tick=0
 
     if audio:
@@ -422,6 +640,8 @@ def show_title(screen, clock, audio=None):
                     (SCREEN_W//2-fs.size("Press ENTER to Start")[0]//2,290))
         screen.blit(fh.render("WASD / Arrows  |  SPACE to attack",True,(120,120,120)),
                     (SCREEN_W//2-fh.size("WASD / Arrows  |  SPACE to attack")[0]//2,340))
+        version_surf = fv.render(PROJECT_VERSION, True, (100,100,100))
+        screen.blit(version_surf, (SCREEN_W-version_surf.get_width()-10, SCREEN_H-20))
         # pixel art sword decoration
         sx=SCREEN_W//2-8
         pygame.draw.rect(screen,(200,210,230),(sx,380,8,60))
@@ -440,9 +660,9 @@ def show_title(screen, clock, audio=None):
         for e in pygame.event.get():
             if e.type==pygame.QUIT: pygame.quit(); sys.exit()
             if e.type==pygame.KEYDOWN and e.key==pygame.K_RETURN:
-                # play the start sfx and fade to black over 5 seconds before starting
+                # play the start sfx and fade to black before starting
                 play_sfx(audio['start_sfx'] if audio else None, volume=1.0)
-                fade_frames_title = 300   # 300 frames = 5 seconds at 60fps
+                fade_frames_title = TITLE_START_DELAY_FRAMES
                 for f in range(fade_frames_title):
                     tick+=1
                     alpha = int(255 * f / fade_frames_title)
@@ -499,13 +719,23 @@ def main():
     while running:
         for event in pygame.event.get():
             if event.type==pygame.QUIT: running=False
+            if event.type==pygame.KEYDOWN and event.key==pygame.K_ESCAPE:
+                pause_action = show_pause_menu(screen, clock, cur, player, hud, rooms, audio)
+                if pause_action == 'exit':
+                    running = False
+
+        if not running:
+            break
 
         keys = pygame.key.get_pressed()
         handle_input(player, keys, solid_tiles(cur))
         player.update()
         cur.update(player)
         hud.update(player)
-        check_collisions(player, cur, audio)
+        fanfare_item = check_collisions(player, cur, audio)
+        if fanfare_item:
+            hud.update(player)
+            show_item_fanfare(screen, clock, cur, player, hud, fanfare_item, audio)
 
         # movement and exit checking - scroll rooms vs single screen rooms work a bit differently
         if is_scroll(cur):
