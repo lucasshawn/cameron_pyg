@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+src/savegame.json
+tests/.tmp_savegame.json

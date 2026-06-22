@@ -433,6 +433,7 @@ class Tile(pygame.sprite.Sprite):
 # the main character - handles movement, combat, health, and drawing
 # =============================================================================
 class Player(pygame.sprite.Sprite):
+    ATTACK_FRAMES = 20
 
     def __init__(self, x, y, assets):
         super().__init__()
@@ -453,7 +454,7 @@ class Player(pygame.sprite.Sprite):
 
         # combat state
         self.is_attacking     = False
-        self.attack_timer     = 0    # counts down from 20 frames per swing
+        self.attack_timer     = 0    # counts down from ATTACK_FRAMES per swing
         self.invincible       = False
         self.invincible_timer = 0    # 90 frames = 1.5 seconds of iframes after getting hit
 
@@ -501,7 +502,7 @@ class Player(pygame.sprite.Sprite):
     def attack(self):
         # cant swing if already mid-swing or no sword
         if self.is_attacking or not self.has_sword: return None
-        self.is_attacking = True; self.attack_timer = 20
+        self.is_attacking = True; self.attack_timer = self.ATTACK_FRAMES
         # return a hitbox rect one tile in front of the player
         ox,oy = {'right':(self.rect.right,self.rect.y),
                  'left': (self.rect.left-TILE_SIZE,self.rect.y),
@@ -547,15 +548,35 @@ class Player(pygame.sprite.Sprite):
         surface.blit(self.image, (self.rect.x-camera_x, self.rect.y-camera_y))
 
     def draw_attack(self, surface, camera_x=0, camera_y=0):
-        # draw a faint yellow flash in front of the player while attacking
+        # draw the sword pivoting from the player's hand into the attack tile
         if not self.is_attacking: return
-        ox,oy = {'right':(self.rect.right,self.rect.y),
-                 'left': (self.rect.left-TILE_SIZE,self.rect.y),
-                 'down': (self.rect.x,self.rect.bottom),
-                 'up':   (self.rect.x,self.rect.top-TILE_SIZE)}[self.direction]
-        slash = pygame.Surface((TILE_SIZE,TILE_SIZE),pygame.SRCALPHA)
-        slash.fill((255,255,200,80))
-        surface.blit(slash,(ox-camera_x,oy-camera_y))
+        progress = 1.0 - (self.attack_timer / self.ATTACK_FRAMES)
+        eased = 0.5 - 0.5 * math.cos(progress * math.pi)
+        hand_x, hand_y, start_angle, end_angle = {
+            'right': (self.rect.right,      self.rect.y + 20, -65, 45),
+            'left':  (self.rect.left,       self.rect.y + 20, 245, 135),
+            'down':  (self.rect.x + 38,     self.rect.bottom, 25, 115),
+            'up':    (self.rect.x + 38,     self.rect.y + 8,  335, 225),
+        }[self.direction]
+        angle = math.radians(start_angle + (end_angle - start_angle) * eased)
+
+        hand = (hand_x - camera_x, hand_y - camera_y)
+        blade_len = TILE_SIZE - 8
+        grip_len = 8
+        tip = (round(hand[0] + math.cos(angle) * blade_len),
+               round(hand[1] + math.sin(angle) * blade_len))
+        pommel = (round(hand[0] - math.cos(angle) * grip_len),
+                  round(hand[1] - math.sin(angle) * grip_len))
+
+        pygame.draw.line(surface,(120,80,35),pommel,hand,6)
+        pygame.draw.line(surface,(210,210,230),hand,tip,6)
+        pygame.draw.line(surface,(245,250,255),hand,tip,2)
+        guard_angle = angle + math.pi / 2
+        guard_a = (round(hand[0] + math.cos(guard_angle) * 8),
+                   round(hand[1] + math.sin(guard_angle) * 8))
+        guard_b = (round(hand[0] - math.cos(guard_angle) * 8),
+                   round(hand[1] - math.sin(guard_angle) * 8))
+        pygame.draw.line(surface,(205,170,60),guard_a,guard_b,4)
 
 
 # =============================================================================
@@ -567,6 +588,8 @@ class Enemy(pygame.sprite.Sprite):
     def __init__(self, x, y, enemy_type, assets, patrol_path=None):
         super().__init__()
         self.rect        = pygame.Rect(x, y, TILE_SIZE, TILE_SIZE)
+        self._x          = float(x)
+        self._y          = float(y)
         self.enemy_type  = enemy_type
         self.hp          = 3
         self.damage      = 1
@@ -600,21 +623,25 @@ class Enemy(pygame.sprite.Sprite):
     def _patrol(self):
         if not self.patrol_path: return
         tx,ty = self.patrol_path[self.patrol_index]
-        dx,dy = tx-self.rect.x, ty-self.rect.y
+        dx,dy = tx-self._x, ty-self._y
         dist  = (dx**2+dy**2)**0.5
         if dist < self.speed:
             self.patrol_index = (self.patrol_index+1)%len(self.patrol_path)
         else:
-            self.rect.x += int(self.speed*dx/dist)
-            self.rect.y += int(self.speed*dy/dist)
+            self._x += self.speed*dx/dist
+            self._y += self.speed*dy/dist
+            self.rect.x = round(self._x)
+            self.rect.y = round(self._y)
 
     def _chase(self, player):
-        dx=player.rect.centerx-self.rect.centerx
-        dy=player.rect.centery-self.rect.centery
+        dx=player.rect.centerx-(self._x + self.rect.width/2)
+        dy=player.rect.centery-(self._y + self.rect.height/2)
         dist=(dx**2+dy**2)**0.5
         if dist>0:
-            self.rect.x+=int(self.speed*dx/dist)
-            self.rect.y+=int(self.speed*dy/dist)
+            self._x+=self.speed*dx/dist
+            self._y+=self.speed*dy/dist
+            self.rect.x=round(self._x)
+            self.rect.y=round(self._y)
 
     def take_damage(self, amount):
         self.hp -= amount
@@ -945,6 +972,7 @@ class ScrollRoom:
         self.rows         = len(grid)
         self.world_w      = self.cols * TILE_SIZE
         self.world_h      = self.rows * TILE_SIZE
+        self.explored_tiles = set()
         self._build_tiles(grid)
         self.cam_x = 0; self.cam_y = 0
 
@@ -959,6 +987,16 @@ class ScrollRoom:
                                 self.world_w - self.VIEWPORT_W))
         self.cam_y = max(0, min(player.rect.centery - self.VIEWPORT_H//2,
                                 self.world_h - self.VIEWPORT_H))
+        self._mark_visible_tiles_explored()
+
+    def _mark_visible_tiles_explored(self):
+        start_col = max(0, self.cam_x // TILE_SIZE)
+        end_col = min(self.cols, (self.cam_x + self.VIEWPORT_W) // TILE_SIZE + 2)
+        start_row = max(0, self.cam_y // TILE_SIZE)
+        end_row = min(self.rows, (self.cam_y + self.VIEWPORT_H) // TILE_SIZE + 2)
+        for row in range(start_row, end_row):
+            for col in range(start_col, end_col):
+                self.explored_tiles.add((col, row))
 
     def get_exit_rects(self):
         # exit rects in world space - placed one tile inward so the player can reach them
